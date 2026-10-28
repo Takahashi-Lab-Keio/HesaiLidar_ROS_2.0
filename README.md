@@ -2,13 +2,67 @@
 This repository includes the ROS Driver for Hesai LiDAR sensor manufactured by Hesai Technology. 
 Developed based on [HesaiLidar_SDK_2.0](https://github.com/HesaiTechnology/HesaiLidar_SDK_2.0), After launched, the project will monitor UDP packets from Lidar,parse data and publish point cloud frames into ROS topic
 
+## Castella fork: Jazzy upgrade (2026-10-28)
+
+`feature/compact-output-upstream-20261028` merges official driver commit
+[`3d54078`](https://github.com/HesaiTechnology/HesaiLidar_ROS_2.0/commit/3d54078a3d770004ef30ec2cacc26673f4172b22)
+(v2.0.12 plus subsequent build updates) into the existing compact-output branch.
+The unmodified SDK is pinned to
+[`357ff14`](https://github.com/HesaiTechnology/HesaiLidar_SDK_2.0/commit/357ff14c0b4486d21ac0de0b218e34546276cacb).
+The previous Castella driver remains available at `b51a404` on `feature/compact-output`.
+
+The ROS 2 compact crop/stride/range filter, per-point timestamps, scan-end timing
+record, diagnostics and explicit JT128 mode selection are retained. The upstream
+ROS IMU conversion was removed, but the pinned JT128 protocol 1.4 SDK still
+decodes acceleration in g and angular velocity in degrees/s. This fork retains
+the conversion to m/s² and rad/s to preserve the FAST-LIO input contract.
+Both sensor timestamps and host receive timestamps are covered by synthetic
+packet tests; the timestamp source is still selected by `use_timestamp_type`.
+PTP messages follow upstream's new variable-length payload definition.
+
+Offline tests require no LiDAR, sockets, motor power or ROS graph. In a Jazzy
+workspace containing this package and its recursively initialized SDK:
+
+```bash
+colcon build --packages-select hesai_ros_driver --cmake-args -DBUILD_TESTING=ON -DFIND_CUDA=OFF
+colcon test --packages-select hesai_ros_driver --return-code-on-test-failure
+colcon test-result --verbose
+```
+
+CUDA is optional. With a CUDA toolkit and GPU available, use a separate build and
+install directory; `89` below is for the tested RTX 4070 Laptop GPU:
+
+```bash
+colcon build --build-base build-gpu --install-base install-gpu --packages-select hesai_ros_driver \
+  --cmake-args -DBUILD_TESTING=ON -DFIND_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89
+colcon test --build-base build-gpu --install-base install-gpu --packages-select hesai_ros_driver \
+  --return-code-on-test-failure
+colcon test-result --test-result-base build-gpu --verbose
+```
+
+The CUDA build additionally compares decoded JT128 coordinates and timestamps
+against CPU output. These comparisons report skipped if no CUDA device is
+available. `use_gpu: true` in YAML alone does not enable a CUDA build. Updating
+this source does not install CUDA or switch Castella's existing CPU build to GPU.
+These checks do not replace verification with live sensor packets and calibration.
+
+Validated on 2026-10-28 in isolated Ubuntu 24.04 / ROS 2 Jazzy containers:
+CPU driver plus Castella FAST-LIO reported 56 tests passing; CUDA 12.6 on the
+RTX 4070 Laptop GPU reported 14 tests passing, with no failures or skipped tests
+(counts from `colcon test-result`, including CTest entries). A separate compact
+pipeline comparison preserved all 37,964 FAST-LIO features and their deskew
+offsets from a synthetic 230,400-point input. No live LiDAR settings or running
+robot processes were changed during validation.
+
 ## Support Lidar type
 
-| Pandar       | OT    | QT       | XT          | AT       | FT    | JT    |
-|:-------------|:------|:---------|:------------|:---------|:------|:------|
-| Pandar40P    | OT128 | PandarQT | PandarXT    | AT128E2X | FT120 | JT16  |
-| Pandar64     | -     | QT128C2X | PandarXT-16 | AT128P   | -     | JT128 |
-| Pandar128E3X | -     | -        | XT32M2X     | ATX      | -     | -     |
+| Pandar       | OT           | QT           | XT           | AT           | FT           | JT           |
+|:------------|:------------|:------------|:------------|:------------|:------------|:------------|
+| Pandar40P    | OT128        | PandarQT     | PandarXT     | AT128E2X     | FT120        | JT128        |
+| Pandar40M    | OT128_40     | QT128C2X     | PandarXT-16  | AT128P       | FTX          | JT64P        |
+| Pandar64     | -            | -            | XT32M2X      | ATX          | -            | JT16         |
+| Pandar128E3X | -            | -            | -            | -            | -            | -            |
+| Pandar90E3X  | -            | -            | -            | -            | -            | -            |
 
 ### Installation dependencies
 
@@ -21,27 +75,31 @@ Install ROS related dependency libraries, please refer to: http://wiki.ros.org
 - Ubuntu 20.04 - ROS2 Foxy desktop
 - Ubuntu 22.04 - ROS2 Humble desktop
 - Ubuntu 24.04 - ROS2 Jazzy desktop
-
-### Install Boost
-
-    sudo apt-get update
-    sudo apt-get install libboost-all-dev
-
-### Install Yaml
-
-    sudo apt-get update
-    sudo apt-get install -y libyaml-cpp-dev
+- Ubuntu 26.04 - ROS2 Lyrical desktop
 
 ### Clone
 
     git clone --recurse-submodules https://github.com/HesaiTechnology/HesaiLidar_ROS_2.0.git
     
 
+### Install dependencies
+
+Boost and yaml-cpp are declared in `package.xml`; the CMake configuration requires the Boost `thread` component and yaml-cpp. After cloning, install all dependencies with `rosdep` from the directory that contains the `src` folder:
+
+    sudo rosdep init     # only once per machine; skip if it reports that it is already initialized
+    rosdep update
+    rosdep install --from-paths src --ignore-src -r -y
+
+On Ubuntu, `rosdep` resolves `boost` to `libboost-all-dev` and `yaml-cpp` to `libyaml-cpp-dev`. If you do not use `rosdep` (for example on an offline machine), install them manually before building:
+
+    sudo apt-get update
+    sudo apt-get install -y libboost-all-dev libyaml-cpp-dev
+
 ### Compile and run
 
 - ros1
 
-    Create an `src` folder, copy the source code of the ros driver into it, and then run the following command:
+    Create an `src` folder, copy the source code of the ros driver into it, and then run the following command in the directory where `src` is located:
         
         catkin_make
         source devel/setup.bash
@@ -49,7 +107,7 @@ Install ROS related dependency libraries, please refer to: http://wiki.ros.org
 
 - ros2
 
-    Create an `src` folder, copy the source code of the ros driver into it, and then run the following command:
+    Create an `src` folder, copy the source code of the ros driver into it, and then run the following command in the directory where `src` is located:
         
         colcon build --symlink-install
         . install/local_setup.bash
@@ -61,6 +119,56 @@ Install ROS related dependency libraries, please refer to: http://wiki.ros.org
     For other ROS2 version
 
         ros2 launch hesai_ros_driver start.py
+
+    If you want to use the files in the `install` folder independently for easy project mobility, replace the original build command with the following command:
+
+        colcon build
+
+### Passing CMake arguments to SDK
+
+You can pass CMake arguments to the SDK during compilation to enable/disable specific features or define custom macros.
+
+- ros1 (catkin)
+
+    Use `catkin_make` with `-D` flags to pass CMake arguments:
+
+        catkin_make -DWITH_PTCS_USE=OFF
+        catkin_make -DCMAKE_CXX_FLAGS="-DMY_CUSTOM_MACRO=1"
+
+- ros2 (colcon)
+
+    Use `--cmake-args` to pass CMake arguments:
+
+        colcon build --symlink-install --cmake-args -DWITH_PTCS_USE=OFF
+        colcon build --symlink-install --cmake-args -DCMAKE_CXX_FLAGS="-DMY_CUSTOM_MACRO=1"
+
+    To pass multiple arguments:
+
+        colcon build --symlink-install --cmake-args -DWITH_PTCS_USE=OFF -DFIND_CUDA=ON
+
+**Available CMake options:**
+
+| Option | Type | Default | Description |
+|:-------|:-----|:--------|:------------|
+| `WITH_PTCS_USE` | BOOL | ON | Enable PTC SSL support |
+| `FIND_CUDA` | BOOL | OFF | Enable CUDA GPU acceleration |
+| `CMAKE_CUDA_ARCHITECTURES` | STRING | 61 | CUDA compute capability (e.g., 50/60/61/70/75/80/86/89/90) |
+
+For more details about SDK compile macros, please refer to [compile_macro_control_description](src/driver/HesaiLidar_SDK_2.0/docs/compile_macro_control_description.md).
+
+### CMake library targets (`hesai_ros_driver` dependencies)
+
+These are the SDK CMake targets linked by `hesai_ros_driver`. **Installable** means the target participates in `cmake --install` / the `install` space as a built artifact (ROS 2 / `colcon`); **INTERFACE** targets are header/usage-only aggregates and are not installed as separate libraries. On ROS 1 / catkin, only `hesai_ros_driver_node` is installed: catkin does not allow installing targets defined in `add_subdirectory`, and the static libraries are already linked into the node.
+
+| CMake target | Type | Installable |
+|:-------------|:-----|:------------|
+| `log_lib` | STATIC or SHARED | Yes |
+| `lidar_lib` | INTERFACE | No |
+| `ptcClient_lib` | STATIC | Yes |
+| `source_lib` | STATIC | Yes |
+| `platutils_lib` | STATIC | Yes |
+| `serialClient_lib` | STATIC | Yes |
+| `udpParser_lib` | INTERFACE | No |
 
 ### Introduction to the configuration file `config.yaml` parameters
 
