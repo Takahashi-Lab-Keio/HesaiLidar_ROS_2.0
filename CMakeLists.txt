@@ -131,6 +131,7 @@ if($ENV{ROS_VERSION} MATCHES "2")
 
     find_package(ament_cmake REQUIRED)
     find_package(sensor_msgs REQUIRED)
+    find_package(diagnostic_msgs REQUIRED)
     find_package(std_msgs REQUIRED)  
     find_package(rclcpp_action REQUIRED)
     find_package(rosidl_typesupport_c REQUIRED) 
@@ -241,7 +242,8 @@ if($ENV{ROS_VERSION} MATCHES "2")
   "rclcpp" 
   "rcutils"
   "std_msgs" 
-  "sensor_msgs" 
+  "sensor_msgs"
+  "diagnostic_msgs"
   # "tf2_geometry_msgs"
   )
 
@@ -264,6 +266,12 @@ endif()
           rviz
           DESTINATION share/${PROJECT_NAME})
 
+  if(BUILD_TESTING)
+    find_package(ament_cmake_gtest REQUIRED)
+    ament_add_gtest(test_cloud_output_filter test/test_cloud_output_filter.cpp)
+    target_include_directories(test_cloud_output_filter PRIVATE src/manager)
+    ament_target_dependencies(test_cloud_output_filter sensor_msgs)
+  endif()
   ament_package()
 
 endif($ENV{ROS_VERSION} MATCHES "2")
