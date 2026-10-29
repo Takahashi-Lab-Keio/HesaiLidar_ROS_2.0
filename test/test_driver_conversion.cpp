@@ -18,7 +18,7 @@ public:
     InitImuPublishers("test_lidar_imu");
   }
   size_t imuSubscribers() const {return imu_pub_->get_subscription_count();}
-  size_t imuDepth() const {return imu_pub_->get_actual_qos().depth();}
+  size_t imuDepth() const {return imu_pub_->get_actual_qos().get_rmw_qos_profile().depth;}
   void compact() {output_filter_.enabled = true; output_filter_.stride = 2;}
 };
 
@@ -32,8 +32,14 @@ T field(const sensor_msgs::msg::PointCloud2 & cloud, size_t point, size_t offset
 
 class ImuDelivery : public ::testing::Test {
 protected:
+#ifdef INSTANTIATE_TEST_SUITE_P
   static void SetUpTestSuite() {rclcpp::init(0, nullptr);}
   static void TearDownTestSuite() {rclcpp::shutdown();}
+#else
+  // Foxy's bundled GoogleTest predates the TestSuite API.
+  static void SetUpTestCase() {rclcpp::init(0, nullptr);}
+  static void TearDownTestCase() {rclcpp::shutdown();}
+#endif
 };
 
 TEST_F(ImuDelivery, BurstRetainsEverySampleAndReportsSourceGaps) {
@@ -223,7 +229,7 @@ TEST_P(Jt128Timestamp, DecodeThroughRosPreservesSelectedClockAndSIUnits) {
   const double expected = GetParam() == 0 ? 1700000000.125 : 1700000001.25;
   ASSERT_EQ(parser->DecodePacket(frame, jt128Packet(1700000001250000ULL)), 0);
   ASSERT_EQ(parser->ComputeXYZI(frame, 0), 0);
-  ASSERT_EQ(frame.valid_points[0], 256);
+  ASSERT_EQ(frame.valid_points[0], 256U);
   frame.points_num = frame.valid_points[0];
   EXPECT_DOUBLE_EQ(frame.frame_start_timestamp, expected);
   EXPECT_DOUBLE_EQ(frame.frame_end_timestamp, expected);
@@ -273,4 +279,8 @@ TEST_P(Jt128Timestamp, DecodeThroughRosPreservesSelectedClockAndSIUnits) {
 #endif
 }
 
+#ifdef INSTANTIATE_TEST_SUITE_P
 INSTANTIATE_TEST_SUITE_P(SensorAndReceiveTime, Jt128Timestamp, ::testing::Values(0, 1));
+#else
+INSTANTIATE_TEST_CASE_P(SensorAndReceiveTime, Jt128Timestamp, ::testing::Values(0, 1));
+#endif

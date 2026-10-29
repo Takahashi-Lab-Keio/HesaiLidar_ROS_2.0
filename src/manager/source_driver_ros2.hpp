@@ -399,7 +399,7 @@ inline void SourceDriver::SendImuConfig(const LidarImuData& msg)
     add("source_age_ms", (node_ptr_->now().seconds() - msg.timestamp) * 1000);
     add("publish_ms", publish_ms);
     add("max_publish_ms", max_imu_publish_ms_);
-    add("qos_depth", imu_pub_->get_actual_qos().depth());
+    add("qos_depth", imu_pub_->get_actual_qos().get_rmw_qos_profile().depth);
     diag.status.push_back(std::move(status));
     imu_diag_pub_->publish(diag);
   }
