@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <map>
 #include "source_driver_ros2.hpp"
 #include "udp_protocol_v1_4.h"
 #include "udp1_4_parser.h"
@@ -11,6 +12,13 @@ class ConversionDriver : public SourceDriver {
 public:
   ConversionDriver() : SourceDriver(DATA_FROM_ROS_PACKET) {frame_id_ = "hesai_lidar";}
   using SourceDriver::ToRosMsg;
+  using SourceDriver::SendImuConfig;
+  void imuPublisher() {
+    node_ptr_ = std::make_shared<rclcpp::Node>("imu_delivery_test_driver");
+    InitImuPublishers("test_lidar_imu");
+  }
+  size_t imuSubscribers() const {return imu_pub_->get_subscription_count();}
+  size_t imuDepth() const {return imu_pub_->get_actual_qos().depth();}
   void compact() {output_filter_.enabled = true; output_filter_.stride = 2;}
 };
 
@@ -20,6 +28,61 @@ T field(const sensor_msgs::msg::PointCloud2 & cloud, size_t point, size_t offset
   std::memcpy(&value, cloud.data.data() + point * cloud.point_step + offset, sizeof(T));
   return value;
 }
+}
+
+class ImuDelivery : public ::testing::Test {
+protected:
+  static void SetUpTestSuite() {rclcpp::init(0, nullptr);}
+  static void TearDownTestSuite() {rclcpp::shutdown();}
+};
+
+TEST_F(ImuDelivery, BurstRetainsEverySampleAndReportsSourceGaps) {
+  ConversionDriver driver;
+  driver.imuPublisher();
+  ASSERT_EQ(driver.imuDepth(), 2000U);
+  auto reader = std::make_shared<rclcpp::Node>("imu_delivery_test_reader");
+  std::vector<double> stamps;
+  std::vector<diagnostic_msgs::msg::DiagnosticStatus> diagnostics;
+  auto sub = reader->create_subscription<sensor_msgs::msg::Imu>("test_lidar_imu", 2000,
+    [&](sensor_msgs::msg::Imu::ConstSharedPtr m) {
+      stamps.push_back(rclcpp::Time(m->header.stamp).seconds());
+    });
+  auto diag_sub = reader->create_subscription<diagnostic_msgs::msg::DiagnosticArray>("imu_diagnostics", 10,
+    [&](diagnostic_msgs::msg::DiagnosticArray::ConstSharedPtr m) {
+      diagnostics.insert(diagnostics.end(), m->status.begin(), m->status.end());
+    });
+  auto wait = [&](auto condition) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!condition() && std::chrono::steady_clock::now() < deadline) {
+      rclcpp::spin_some(reader);
+      std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return condition();
+  };
+  ASSERT_TRUE(wait([&] {return driver.imuSubscribers() == 1 &&
+    reader->count_publishers("imu_diagnostics") == 1;}));
+  LidarImuData msg;
+  // Hold the ROS callback executor while one second of acquired data arrives
+  // in a burst. No missing time is synthesized by the publisher.
+  for (int i = 0; i < 400; ++i) {
+    msg.timestamp = 10 + i*.0025;
+    driver.SendImuConfig(msg);
+  }
+  ASSERT_TRUE(wait([&] {return stamps.size() == 400;}));
+  for (size_t i = 0; i < stamps.size(); ++i)
+    EXPECT_NEAR(stamps[i], 10 + i*.0025, 1e-8);
+  msg.timestamp += .219;
+  driver.SendImuConfig(msg);
+  ASSERT_TRUE(wait([&] {
+    return !diagnostics.empty() && diagnostics.back().level ==
+      diagnostic_msgs::msg::DiagnosticStatus::WARN;
+  }));
+  std::map<std::string, double> values;
+  for (const auto &kv : diagnostics.back().values) values[kv.key] = std::stod(kv.value);
+  EXPECT_EQ(values["stamp_gaps_over_100ms"], 1);
+  EXPECT_NEAR(values["max_stamp_gap_seconds"], .219, 1e-6);
+  EXPECT_EQ(values["published_samples"], 401);
+  EXPECT_EQ(values["qos_depth"], 2000);
 }
 
 TEST(DriverConversion, Jt128PacketAccelerationAndGyroRemainInSIUnits) {

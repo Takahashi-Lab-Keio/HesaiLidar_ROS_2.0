@@ -83,6 +83,7 @@ protected:
   void SendPTP(const uint8_t& ptp_lock_offset, const u8Array_t& ptp_status);
   // Used to publish the imu packet
   void SendImuConfig(const LidarImuData& msg);
+  void InitImuPublishers(const std::string &topic);
   // Publish raw data packets, sending them one by one
   void SendPacketOneByOne(const UdpPacket& ros_msg, double timestamp);
 
@@ -124,6 +125,11 @@ protected:
   std::chrono::steady_clock::time_point last_cloud_receipt_{};
   int requested_rpm_ = -1, requested_return_mode_ = -1;
   uint64_t cloud_drop_count_ = 0;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr imu_diag_pub_;
+  std::chrono::steady_clock::time_point last_imu_callback_{}, last_imu_diagnostic_{};
+  double last_imu_stamp_ = 0.0, max_imu_stamp_gap_ = 0.0;
+  double max_imu_callback_gap_ = 0.0, max_imu_publish_ms_ = 0.0;
+  uint64_t imu_published_ = 0, imu_stamp_gaps_ = 0, imu_non_increasing_ = 0;
 
   //spin thread while Receive data from ROS topic
   boost::thread* subscription_spin_thread_;
@@ -168,11 +174,7 @@ inline void SourceDriver::Init(const YAML::Node& config)
     pub_ = node_ptr_->create_publisher<sensor_msgs::msg::PointCloud2>(driver_param.input_param.ros_send_point_topic, 10);
   }
   if (driver_param.input_param.send_imu_ros) {
-    int imu_queue_size = 20;
-    if (driver_param.input_param.source_type == DATA_FROM_PCAP || driver_param.input_param.source_type == DATA_FROM_ROS_PACKET) {
-      imu_queue_size = 200;
-    }
-    imu_pub_ = node_ptr_->create_publisher<sensor_msgs::msg::Imu>(driver_param.input_param.ros_send_imu_topic, imu_queue_size);
+    InitImuPublishers(driver_param.input_param.ros_send_imu_topic);
   }
 
   if (driver_param.input_param.ros_send_packet_loss_topic != NULL_TOPIC) {
@@ -354,7 +356,65 @@ inline void SourceDriver::SendPTP(const uint8_t& ptp_lock_offset, const u8Array_
 
 inline void SourceDriver::SendImuConfig(const LidarImuData& msg)
 {
+  using Clock = std::chrono::steady_clock;
+  const auto start = Clock::now();
+  const double stamp_gap = imu_published_ ? msg.timestamp - last_imu_stamp_ : 0.0;
+  const double callback_gap = imu_published_ ?
+    std::chrono::duration<double>(start - last_imu_callback_).count() : 0.0;
+  max_imu_stamp_gap_ = std::max(max_imu_stamp_gap_, stamp_gap);
+  max_imu_callback_gap_ = std::max(max_imu_callback_gap_, callback_gap);
+  if (stamp_gap > 0.1) ++imu_stamp_gaps_;
+  if (imu_published_ && stamp_gap <= 0.0) ++imu_non_increasing_;
+  last_imu_stamp_ = msg.timestamp;
+  last_imu_callback_ = start;
   imu_pub_->publish(ToRosMsg(msg));
+  const double publish_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+  max_imu_publish_ms_ = std::max(max_imu_publish_ms_, publish_ms);
+  ++imu_published_;
+  // SDK callbacks are serialized. Report from the publishing side, allowing
+  // bags to distinguish an SDK/source gap from a downstream ROS reader gap.
+  if (imu_published_ == 1 || stamp_gap > 0.1 || callback_gap > 0.1 ||
+      start - last_imu_diagnostic_ >= std::chrono::seconds(1)) {
+    last_imu_diagnostic_ = start;
+    diagnostic_msgs::msg::DiagnosticArray diag;
+    diag.header.stamp = node_ptr_->now();
+    diagnostic_msgs::msg::DiagnosticStatus status;
+    status.name = "hesai/imu_delivery";
+    status.hardware_id = frame_id_;
+    status.level = imu_stamp_gaps_ ? diagnostic_msgs::msg::DiagnosticStatus::WARN :
+                                   diagnostic_msgs::msg::DiagnosticStatus::OK;
+    status.message = imu_stamp_gaps_ ? "published_with_source_stamp_gaps" : "published";
+    auto add = [&status](const char *key, double value) {
+      diagnostic_msgs::msg::KeyValue kv;
+      kv.key = key; kv.value = std::to_string(value); status.values.push_back(kv);
+    };
+    add("published_samples", imu_published_);
+    add("stamp", msg.timestamp);
+    add("stamp_gap_seconds", stamp_gap);
+    add("max_stamp_gap_seconds", max_imu_stamp_gap_);
+    add("stamp_gaps_over_100ms", imu_stamp_gaps_);
+    add("non_increasing_stamps", imu_non_increasing_);
+    add("callback_gap_seconds", callback_gap);
+    add("max_callback_gap_seconds", max_imu_callback_gap_);
+    add("source_age_ms", (node_ptr_->now().seconds() - msg.timestamp) * 1000);
+    add("publish_ms", publish_ms);
+    add("max_publish_ms", max_imu_publish_ms_);
+    add("qos_depth", imu_pub_->get_actual_qos().depth());
+    diag.status.push_back(std::move(status));
+    imu_diag_pub_->publish(diag);
+  }
+}
+
+inline void SourceDriver::InitImuPublishers(const std::string &topic)
+{
+  // 20 samples only covered about 50 ms at 400 Hz. Retain bursts caused by
+  // startup scheduling / DDS discovery without filling gaps or changing time.
+  const int depth = node_ptr_->declare_parameter("imu_qos_depth", 2000);
+  if (depth < 1 || depth > 100000) throw std::invalid_argument("invalid imu_qos_depth");
+  imu_pub_ = node_ptr_->create_publisher<sensor_msgs::msg::Imu>(
+    topic, rclcpp::QoS(depth).reliable().durability_volatile());
+  imu_diag_pub_ = node_ptr_->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+    "imu_diagnostics", 10);
 }
 
 inline void SourceDriver::SendPacketOneByOne(const UdpPacket& msg, double timestamp)

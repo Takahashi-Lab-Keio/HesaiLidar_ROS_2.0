@@ -54,6 +54,17 @@ pipeline comparison preserved all 37,964 FAST-LIO features and their deskew
 offsets from a synthetic 230,400-point input. No live LiDAR settings or running
 robot processes were changed during validation.
 
+The ROS 2 IMU publisher uses reliable, volatile history with 2000 samples
+(`imu_qos_depth`, configurable at startup). The old live-source depth of 20
+covered only about 50 ms at 400 Hz. Increasing history retains startup bursts;
+it does not interpolate missing IMU samples or change their timestamps.
+`imu_diagnostics` in the driver namespace reports source-stamp gaps over
+100 ms, non-increasing stamps, maximum callback interval, maximum publish
+duration and the published sample count. Counters/maxima are cumulative from
+driver startup; diagnostics are emitted once per second and on large gaps.
+These measurements distinguish SDK/source timestamp gaps from downstream ROS
+reader loss; neither a source gap nor a callback delay alone proves a hardware fault.
+
 ## Support Lidar type
 
 | Pandar       | OT           | QT           | XT           | AT           | FT           | JT           |
