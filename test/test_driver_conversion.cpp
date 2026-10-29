@@ -57,10 +57,12 @@ TEST_F(ImuDelivery, BurstRetainsEverySampleAndReportsSourceGaps) {
     [&](diagnostic_msgs::msg::DiagnosticArray::ConstSharedPtr m) {
       diagnostics.insert(diagnostics.end(), m->status.begin(), m->status.end());
     });
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(reader);
   auto wait = [&](auto condition) {
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (!condition() && std::chrono::steady_clock::now() < deadline) {
-      rclcpp::spin_some(reader);
+      executor.spin_some();
       std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
     return condition();
