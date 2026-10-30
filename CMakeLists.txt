@@ -126,6 +126,7 @@ if($ENV{ROS_VERSION} MATCHES "2")
 
     find_package(ament_cmake REQUIRED)
     find_package(sensor_msgs REQUIRED)
+    find_package(diagnostic_msgs REQUIRED)
     find_package(std_msgs REQUIRED)  
     find_package(rcutils REQUIRED)
     find_package(rcl_interfaces REQUIRED)
@@ -255,6 +256,7 @@ if($ENV{ROS_VERSION} MATCHES "2")
     "rcutils"
     "std_msgs" 
     "sensor_msgs"
+    "diagnostic_msgs"
     "rclcpp_action"
     # "tf2_geometry_msgs"
     )
@@ -266,6 +268,7 @@ if($ENV{ROS_VERSION} MATCHES "2")
       rcutils
       std_msgs
       sensor_msgs
+      diagnostic_msgs
       rclcpp_action
     )
     foreach(dependency IN LISTS ROS2_TARGET_DEPENDENCIES)
@@ -303,6 +306,30 @@ if($ENV{ROS_VERSION} MATCHES "2")
           config
           DESTINATION share/${PROJECT_NAME})
 
+  if(BUILD_TESTING)
+    find_package(ament_cmake_gtest REQUIRED)
+    ament_add_gtest(test_cloud_output_filter test/test_cloud_output_filter.cpp)
+    target_include_directories(test_cloud_output_filter PRIVATE src/manager)
+    if(COMMAND ament_target_dependencies)
+      ament_target_dependencies(test_cloud_output_filter sensor_msgs)
+    else()
+      target_link_libraries(test_cloud_output_filter ${sensor_msgs_TARGETS})
+    endif()
+    ament_add_gtest(test_driver_conversion test/test_driver_conversion.cpp)
+    target_include_directories(test_driver_conversion PRIVATE src/manager)
+    target_link_libraries(test_driver_conversion ${LIB_TARGETS} ${Boost_LIBRARIES} ${YAML_CPP_LIBRARIES})
+    if(COMMAND ament_target_dependencies)
+      ament_target_dependencies(test_driver_conversion rclcpp sensor_msgs std_msgs diagnostic_msgs)
+    else()
+      target_link_libraries(test_driver_conversion
+        ${rclcpp_TARGETS} ${sensor_msgs_TARGETS} ${std_msgs_TARGETS} ${diagnostic_msgs_TARGETS})
+    endif()
+    if(COMMAND rosidl_get_typesupport_target)
+      target_link_libraries(test_driver_conversion "${cpp_typesupport_target}")
+    else()
+      rosidl_target_interfaces(test_driver_conversion ${PROJECT_NAME} "rosidl_typesupport_cpp")
+    endif()
+  endif()
   ament_package()
 
 endif($ENV{ROS_VERSION} MATCHES "2")

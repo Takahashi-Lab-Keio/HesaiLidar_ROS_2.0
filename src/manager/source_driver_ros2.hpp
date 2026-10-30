@@ -47,6 +47,8 @@
 #include <functional>
 #include <boost/thread.hpp>
 #include "source_drive_common.hpp"
+#include "cloud_output_filter.hpp"
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
 
 class SourceDriver
 {
@@ -81,6 +83,7 @@ protected:
   void SendPTP(const uint8_t& ptp_lock_offset, const u8Array_t& ptp_status);
   // Used to publish the imu packet
   void SendImuConfig(const LidarImuData& msg);
+  void InitImuPublishers(const std::string &topic);
   // Publish raw data packets, sending them one by one
   void SendPacketOneByOne(const UdpPacket& ros_msg, double timestamp);
 
@@ -99,10 +102,10 @@ protected:
   hesai_ros_driver::msg::UdpPacket ToRosMsg(const UdpPacket& ros_msg, double timestamp);
   // Convert imu, imu into ROS message
   sensor_msgs::msg::Imu ToRosMsg(const LidarImuData& firetime_correction_);
-  // Convert Linear Acceleration from g to m/s^2
-  // double From_g_To_ms2(double g);
+  // The bundled JT128 parser still reports g and degrees/s. Keep ROS SI units.
+  double From_g_To_ms2(double g);
   // Convert Angular Velocity from degree/s to radian/s
-  // double From_degs_To_rads(double degree);
+  double From_degs_To_rads(double degree);
   std::string frame_id_;
 
   rclcpp::Subscription<std_msgs::msg::UInt8MultiArray>::SharedPtr crt_sub_;
@@ -116,6 +119,18 @@ protected:
   rclcpp::Publisher<sensor_msgs::msg::Imu>::SharedPtr imu_pub_;
   rclcpp::Publisher<hesai_ros_driver::msg::UdpPacket>::SharedPtr every_pkt_pub_;
 
+  hesai_ros::CloudOutputFilter output_filter_;
+  hesai_ros::CloudOutputStats output_stats_;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr cloud_diag_pub_;
+  std::chrono::steady_clock::time_point last_cloud_receipt_{};
+  int requested_rpm_ = -1, requested_return_mode_ = -1;
+  uint64_t cloud_drop_count_ = 0;
+  rclcpp::Publisher<diagnostic_msgs::msg::DiagnosticArray>::SharedPtr imu_diag_pub_;
+  std::chrono::steady_clock::time_point last_imu_callback_{}, last_imu_diagnostic_{};
+  double last_imu_stamp_ = 0.0, max_imu_stamp_gap_ = 0.0;
+  double max_imu_callback_gap_ = 0.0, max_imu_publish_ms_ = 0.0;
+  uint64_t imu_published_ = 0, imu_stamp_gaps_ = 0, imu_non_increasing_ = 0;
+
   //spin thread while Receive data from ROS topic
   boost::thread* subscription_spin_thread_;
 };
@@ -127,15 +142,39 @@ inline void SourceDriver::Init(const YAML::Node& config)
   frame_id_ = driver_param.input_param.frame_id;
 
   node_ptr_.reset(new rclcpp::Node("hesai_ros_driver_node"));
+  output_filter_.enabled = node_ptr_->declare_parameter("output_filter.enabled", false);
+  const int stride = node_ptr_->declare_parameter("output_filter.stride", 1);
+  if (stride < 1 || stride > 65535) throw std::invalid_argument("invalid output_filter.stride");
+  output_filter_.stride = static_cast<uint16_t>(stride);
+  output_filter_.crop_enabled = node_ptr_->declare_parameter("output_filter.crop_enabled", false);
+  auto read_array = [this](const std::string &name, auto &destination) {
+    const std::vector<double> defaults(destination.begin(), destination.end());
+    const auto values = node_ptr_->declare_parameter<std::vector<double>>(name, defaults);
+    if (values.size() != destination.size()) throw std::invalid_argument(name + ": wrong size");
+    std::copy(values.begin(), values.end(), destination.begin());
+  };
+  read_array("output_filter.crop_min", output_filter_.crop_min);
+  read_array("output_filter.crop_max", output_filter_.crop_max);
+  read_array("output_filter.rotation", output_filter_.rotation);
+  read_array("output_filter.translation", output_filter_.translation);
+  output_filter_.min_range = node_ptr_->declare_parameter("output_filter.min_range", 0.0);
+  output_filter_.max_range = node_ptr_->declare_parameter("output_filter.max_range", 1000.0);
+  output_filter_.validate();
+  requested_rpm_ = node_ptr_->declare_parameter("requested_spin_speed", -1);
+  requested_return_mode_ = node_ptr_->declare_parameter("requested_return_mode", -1);
+  if (!((requested_rpm_ == -1 && requested_return_mode_ == -1) ||
+        (requested_rpm_ == 1200 && requested_return_mode_ == 1) ||
+        (requested_rpm_ == 600 && requested_return_mode_ == 2)))
+    throw std::invalid_argument("supported modes: unchanged, 1200/strongest, 600/dual");
+  if (requested_rpm_ != -1 && driver_param.input_param.source_type != DATA_FROM_LIDAR)
+    throw std::invalid_argument("sensor mode changes require a live LiDAR source");
+  cloud_diag_pub_ = node_ptr_->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+    "pointcloud_diagnostics", 10);
   if (driver_param.input_param.send_point_cloud_ros) {
     pub_ = node_ptr_->create_publisher<sensor_msgs::msg::PointCloud2>(driver_param.input_param.ros_send_point_topic, 10);
   }
   if (driver_param.input_param.send_imu_ros) {
-    int imu_queue_size = 20;
-    if (driver_param.input_param.source_type == DATA_FROM_PCAP || driver_param.input_param.source_type == DATA_FROM_ROS_PACKET) {
-      imu_queue_size = 200;
-    }
-    imu_pub_ = node_ptr_->create_publisher<sensor_msgs::msg::Imu>(driver_param.input_param.ros_send_imu_topic, imu_queue_size);
+    InitImuPublishers(driver_param.input_param.ros_send_imu_topic);
   }
 
   if (driver_param.input_param.ros_send_packet_loss_topic != NULL_TOPIC) {
@@ -207,6 +246,23 @@ inline void SourceDriver::Init(const YAML::Node& config)
 
 inline void SourceDriver::Start()
 {
+  if (requested_rpm_ != -1) {
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    while (!driver_ptr_->lidar_ptr_->GetInitFinish(AllInitFinish)) {
+      if (!rclcpp::ok() || std::chrono::steady_clock::now() > deadline)
+        throw std::runtime_error("timed out waiting to configure JT128 mode");
+      std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    auto lidar = driver_ptr_->lidar_ptr_;
+    if (lidar->GetLidarType() != "JT128" || !lidar->ptc_client_)
+      throw std::runtime_error("explicit sensor mode profiles require JT128 with PTC");
+    // Only these two mode commands are sent. Network/calibration settings are untouched.
+    if (!lidar->ptc_client_->SetReturnMode(static_cast<uint8_t>(requested_return_mode_)) ||
+        !lidar->ptc_client_->SetSpinSpeed(static_cast<uint32_t>(requested_rpm_)))
+      throw std::runtime_error("JT128 rejected mode change; inspect sensor mode before restarting");
+    RCLCPP_INFO(node_ptr_->get_logger(), "Requested JT128 %d RPM, return mode %d",
+      requested_rpm_, requested_return_mode_);
+  }
   driver_ptr_->Start();
 }
 
@@ -217,7 +273,7 @@ inline SourceDriver::~SourceDriver()
 
 inline void SourceDriver::Stop()
 {
-  driver_ptr_->Stop();
+  if (driver_ptr_) driver_ptr_->Stop();
 }
 
 inline void SourceDriver::SendPacket(const UdpFrame_t& msg, double timestamp)
@@ -227,7 +283,60 @@ inline void SourceDriver::SendPacket(const UdpFrame_t& msg, double timestamp)
 
 inline void SourceDriver::SendPointCloud(const LidarDecodedFrame<LidarPointXYZIRT>& msg)
 {
-  pub_->publish(ToRosMsg(msg, frame_id_));
+  using Clock = std::chrono::steady_clock;
+  const auto start = Clock::now();
+  const double interval_ms = last_cloud_receipt_ == Clock::time_point{} ? 0.0 :
+    std::chrono::duration<double, std::milli>(start - last_cloud_receipt_).count();
+  last_cloud_receipt_ = start;
+  diagnostic_msgs::msg::DiagnosticArray diag;
+  diag.header.stamp = node_ptr_->now();
+  diagnostic_msgs::msg::DiagnosticStatus status;
+  status.name = "hesai/pointcloud_output";
+  status.hardware_id = frame_id_;
+  auto add = [&status](const std::string &key, double value) {
+    diagnostic_msgs::msg::KeyValue kv;
+    kv.key = key; kv.value = std::to_string(value); status.values.push_back(kv);
+  };
+  add("frame_index", msg.frame_index);
+  add("scan_start", msg.frame_start_timestamp);
+  add("sdk_interval_ms", interval_ms);
+  add("return_mode", msg.return_mode);
+  const double scan_span = msg.frame_end_timestamp - msg.frame_start_timestamp;
+  add("scan_span_ms", scan_span * 1000);
+  try {
+    if (requested_rpm_ != -1 &&
+        (scan_span < (requested_rpm_ == 1200 ? 0.025 : 0.075) ||
+         scan_span > (requested_rpm_ == 1200 ? 0.075 : 0.125) ||
+         msg.return_mode != (requested_return_mode_ == 1 ? 0x37 : 0x39)))
+      throw std::runtime_error("waiting for requested RPM/return mode in sensor packets");
+    auto cloud = ToRosMsg(msg, frame_id_);
+    const auto converted = Clock::now();
+    add("scan_end", output_stats_.scan_end);
+    add("scan_end_age_ms", (node_ptr_->now().seconds() - output_stats_.scan_end) * 1000);
+    add("input_points", output_stats_.input_points);
+    add("usable_points", output_stats_.selected_points);
+    add("crop_removed", output_stats_.crop_removed);
+    add("invalid_points", output_stats_.invalid_points);
+    add("range_removed", output_stats_.range_removed);
+    add("timing_point", output_stats_.timing_point);
+    add("output_bytes", cloud.data.size());
+    add("stride", output_filter_.enabled ? output_filter_.stride : 1);
+    add("conversion_ms", std::chrono::duration<double, std::milli>(converted - start).count());
+    if (cloud.width == 0) throw std::runtime_error("no usable cloud points");
+    pub_->publish(cloud);
+    add("publish_ms", std::chrono::duration<double, std::milli>(Clock::now() - converted).count());
+    status.message = "published";
+  } catch (const std::exception &error) {
+    ++cloud_drop_count_;
+    status.level = diagnostic_msgs::msg::DiagnosticStatus::ERROR;
+    status.message = error.what();
+    RCLCPP_WARN_THROTTLE(node_ptr_->get_logger(), *node_ptr_->get_clock(), 2000,
+      "Dropping point cloud: %s", error.what());
+  }
+  add("dropped_frames", cloud_drop_count_);
+  add("callback_ms", std::chrono::duration<double, std::milli>(Clock::now() - start).count());
+  diag.status.push_back(std::move(status));
+  cloud_diag_pub_->publish(diag);
 }
 
 inline void SourceDriver::SendCorrection(const u8Array_t& msg)
@@ -247,7 +356,65 @@ inline void SourceDriver::SendPTP(const uint8_t& ptp_lock_offset, const u8Array_
 
 inline void SourceDriver::SendImuConfig(const LidarImuData& msg)
 {
+  using Clock = std::chrono::steady_clock;
+  const auto start = Clock::now();
+  const double stamp_gap = imu_published_ ? msg.timestamp - last_imu_stamp_ : 0.0;
+  const double callback_gap = imu_published_ ?
+    std::chrono::duration<double>(start - last_imu_callback_).count() : 0.0;
+  max_imu_stamp_gap_ = std::max(max_imu_stamp_gap_, stamp_gap);
+  max_imu_callback_gap_ = std::max(max_imu_callback_gap_, callback_gap);
+  if (stamp_gap > 0.1) ++imu_stamp_gaps_;
+  if (imu_published_ && stamp_gap <= 0.0) ++imu_non_increasing_;
+  last_imu_stamp_ = msg.timestamp;
+  last_imu_callback_ = start;
   imu_pub_->publish(ToRosMsg(msg));
+  const double publish_ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+  max_imu_publish_ms_ = std::max(max_imu_publish_ms_, publish_ms);
+  ++imu_published_;
+  // SDK callbacks are serialized. Report from the publishing side, allowing
+  // bags to distinguish an SDK/source gap from a downstream ROS reader gap.
+  if (imu_published_ == 1 || stamp_gap > 0.1 || callback_gap > 0.1 ||
+      start - last_imu_diagnostic_ >= std::chrono::seconds(1)) {
+    last_imu_diagnostic_ = start;
+    diagnostic_msgs::msg::DiagnosticArray diag;
+    diag.header.stamp = node_ptr_->now();
+    diagnostic_msgs::msg::DiagnosticStatus status;
+    status.name = "hesai/imu_delivery";
+    status.hardware_id = frame_id_;
+    status.level = imu_stamp_gaps_ ? diagnostic_msgs::msg::DiagnosticStatus::WARN :
+                                   diagnostic_msgs::msg::DiagnosticStatus::OK;
+    status.message = imu_stamp_gaps_ ? "published_with_source_stamp_gaps" : "published";
+    auto add = [&status](const char *key, double value) {
+      diagnostic_msgs::msg::KeyValue kv;
+      kv.key = key; kv.value = std::to_string(value); status.values.push_back(kv);
+    };
+    add("published_samples", imu_published_);
+    add("stamp", msg.timestamp);
+    add("stamp_gap_seconds", stamp_gap);
+    add("max_stamp_gap_seconds", max_imu_stamp_gap_);
+    add("stamp_gaps_over_100ms", imu_stamp_gaps_);
+    add("non_increasing_stamps", imu_non_increasing_);
+    add("callback_gap_seconds", callback_gap);
+    add("max_callback_gap_seconds", max_imu_callback_gap_);
+    add("source_age_ms", (node_ptr_->now().seconds() - msg.timestamp) * 1000);
+    add("publish_ms", publish_ms);
+    add("max_publish_ms", max_imu_publish_ms_);
+    add("qos_depth", imu_pub_->get_actual_qos().get_rmw_qos_profile().depth);
+    diag.status.push_back(std::move(status));
+    imu_diag_pub_->publish(diag);
+  }
+}
+
+inline void SourceDriver::InitImuPublishers(const std::string &topic)
+{
+  // 20 samples only covered about 50 ms at 400 Hz. Retain bursts caused by
+  // startup scheduling / DDS discovery without filling gaps or changing time.
+  const int depth = node_ptr_->declare_parameter("imu_qos_depth", 2000);
+  if (depth < 1 || depth > 100000) throw std::invalid_argument("invalid imu_qos_depth");
+  imu_pub_ = node_ptr_->create_publisher<sensor_msgs::msg::Imu>(
+    topic, rclcpp::QoS(depth).reliable().durability_volatile());
+  imu_diag_pub_ = node_ptr_->create_publisher<diagnostic_msgs::msg::DiagnosticArray>(
+    "imu_diagnostics", 10);
 }
 
 inline void SourceDriver::SendPacketOneByOne(const UdpPacket& msg, double timestamp)
@@ -256,67 +423,12 @@ inline void SourceDriver::SendPacketOneByOne(const UdpPacket& msg, double timest
 }
 inline sensor_msgs::msg::PointCloud2 SourceDriver::ToRosMsg(const LidarDecodedFrame<LidarPointXYZIRT>& frame, const std::string& frame_id)
 {
-  sensor_msgs::msg::PointCloud2 ros_msg;
-  uint32_t points_number = (frame.fParam.IsMultiFrameFrequency() == 0) ? frame.points_num : frame.multi_points_num;
-  uint32_t packet_number = (frame.fParam.IsMultiFrameFrequency() == 0) ? frame.packet_num : frame.multi_packet_num;
-  LidarPointXYZIRT *pPoints = (frame.fParam.IsMultiFrameFrequency() == 0) ? frame.points : frame.multi_points;
-  int frame_index = (frame.fParam.IsMultiFrameFrequency() == 0) ? frame.frame_index : frame.multi_frame_index;
-  double frame_start_timestamp = (frame.fParam.IsMultiFrameFrequency() == 0) ? frame.frame_start_timestamp : frame.multi_frame_start_timestamp;
-  double frame_end_timestamp = (frame.fParam.IsMultiFrameFrequency() == 0) ? frame.frame_end_timestamp : frame.multi_frame_end_timestamp;
-  const char *prefix = (frame.fParam.IsMultiFrameFrequency() == 0) ? "raw" : "multi";
-  int fields = 6;
-  ros_msg.fields.clear();
-  ros_msg.fields.reserve(fields);
-  ros_msg.width = points_number; 
-  ros_msg.height = 1; 
-
-  int offset = 0;
-  offset = addPointField(ros_msg, "x", 1, sensor_msgs::msg::PointField::FLOAT32, offset);
-  offset = addPointField(ros_msg, "y", 1, sensor_msgs::msg::PointField::FLOAT32, offset);
-  offset = addPointField(ros_msg, "z", 1, sensor_msgs::msg::PointField::FLOAT32, offset);
-  offset = addPointField(ros_msg, "intensity", 1, sensor_msgs::msg::PointField::FLOAT32, offset);
-  offset = addPointField(ros_msg, "ring", 1, sensor_msgs::msg::PointField::UINT16, offset);
-  offset = addPointField(ros_msg, "timestamp", 1, sensor_msgs::msg::PointField::FLOAT64, offset);
-
-  ros_msg.point_step = offset;
-  ros_msg.row_step = ros_msg.width * ros_msg.point_step;
-  ros_msg.is_dense = false;
-  ros_msg.data.resize(points_number * ros_msg.point_step);
-
-  sensor_msgs::PointCloud2Iterator<float> iter_x_(ros_msg, "x");
-  sensor_msgs::PointCloud2Iterator<float> iter_y_(ros_msg, "y");
-  sensor_msgs::PointCloud2Iterator<float> iter_z_(ros_msg, "z");
-  sensor_msgs::PointCloud2Iterator<float> iter_intensity_(ros_msg, "intensity");
-  sensor_msgs::PointCloud2Iterator<uint16_t> iter_ring_(ros_msg, "ring");
-  sensor_msgs::PointCloud2Iterator<double> iter_timestamp_(ros_msg, "timestamp");
-  for (size_t i = 0; i < points_number; i++)
-  {
-    LidarPointXYZIRT point = pPoints[i];
-    *iter_x_ = point.x;
-    *iter_y_ = point.y;
-    *iter_z_ = point.z;
-    *iter_intensity_ = point.intensity;
-    *iter_ring_ = point.ring;
-    *iter_timestamp_ = point.timestamp;
-    ++iter_x_;
-    ++iter_y_;
-    ++iter_z_;
-    ++iter_intensity_;
-    ++iter_ring_;
-    ++iter_timestamp_;   
-  }
-  // RCLCPP_DEBUG(node_ptr_->get_logger(), "HesaiLidar Runing Status [standby mode:%u]  |  [speed:%u]\n", frame.work_mode, frame.spin_speed);
-  RCLCPP_DEBUG(node_ptr_->get_logger(), "%s frame:%d points:%u packet:%d start time:%lf end time:%lf\n", prefix, frame_index, points_number, packet_number, frame_start_timestamp, frame_end_timestamp);
-  std::cout.flush();
-  auto sec = (uint64_t)floor(frame_start_timestamp);
-  if (sec <= std::numeric_limits<int32_t>::max()) {
-    ros_msg.header.stamp.sec = (uint32_t)floor(frame_start_timestamp);
-    ros_msg.header.stamp.nanosec = (uint32_t)round((frame_start_timestamp - ros_msg.header.stamp.sec) * 1e9);
-  } else {
-    RCLCPP_ERROR(node_ptr_->get_logger(), "does not support timestamps greater than 19 January 2038 03:14:07 (now %lf)\n", frame_start_timestamp);
-  }
-  ros_msg.header.frame_id = frame_id_;
-  return ros_msg;
+  const bool multi = frame.fParam.IsMultiFrameFrequency() != 0;
+  return hesai_ros::makeOutputCloud(
+    multi ? frame.multi_points : frame.points,
+    multi ? frame.multi_points_num : frame.points_num,
+    multi ? frame.multi_frame_start_timestamp : frame.frame_start_timestamp,
+    frame_id, output_filter_, output_stats_);
 }
 
 inline hesai_ros_driver::msg::UdpPacket SourceDriver::ToRosMsg(const UdpPacket& ros_msg, double timestamp) {
@@ -391,12 +503,12 @@ inline sensor_msgs::msg::Imu SourceDriver::ToRosMsg(const LidarImuData &imu_conf
     RCLCPP_ERROR(node_ptr_->get_logger(), "does not support timestamps greater than 19 January 2038 03:14:07 (now %lf)\n", imu_config_.timestamp);
   }
   ros_msg.header.frame_id = frame_id_;
-  ros_msg.linear_acceleration.x = (imu_config_.imu_accel_x);
-  ros_msg.linear_acceleration.y = (imu_config_.imu_accel_y);
-  ros_msg.linear_acceleration.z = (imu_config_.imu_accel_z);
-  ros_msg.angular_velocity.x = (imu_config_.imu_ang_vel_x);
-  ros_msg.angular_velocity.y = (imu_config_.imu_ang_vel_y);
-  ros_msg.angular_velocity.z = (imu_config_.imu_ang_vel_z);
+  ros_msg.linear_acceleration.x = From_g_To_ms2(imu_config_.imu_accel_x);
+  ros_msg.linear_acceleration.y = From_g_To_ms2(imu_config_.imu_accel_y);
+  ros_msg.linear_acceleration.z = From_g_To_ms2(imu_config_.imu_accel_z);
+  ros_msg.angular_velocity.x = From_degs_To_rads(imu_config_.imu_ang_vel_x);
+  ros_msg.angular_velocity.y = From_degs_To_rads(imu_config_.imu_ang_vel_y);
+  ros_msg.angular_velocity.z = From_degs_To_rads(imu_config_.imu_ang_vel_z);
   return ros_msg;
 }
 
@@ -419,12 +531,14 @@ inline void SourceDriver::ReceiveCorrection(const std_msgs::msg::UInt8MultiArray
   }
 }
 
-// inline double SourceDriver::From_g_To_ms2(double g)
-// {
-//   return g * 9.80665;
-// }
+// Preserve the pre-upgrade ROS contract: m/s^2 and rad/s. The upstream
+// 357ff14 SDK accessors return raw g and degrees/s for JT128 (protocol 1.4).
+inline double SourceDriver::From_g_To_ms2(double g)
+{
+  return g * 9.80665;
+}
 
-// inline double SourceDriver::From_degs_To_rads(double degree)
-// {
-//   return degree * M_PI / 180.0;
-// }
+inline double SourceDriver::From_degs_To_rads(double degree)
+{
+  return degree * M_PI / 180.0;
+}

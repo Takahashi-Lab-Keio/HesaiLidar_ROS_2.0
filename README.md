@@ -2,6 +2,69 @@
 This repository includes the ROS Driver for Hesai LiDAR sensor manufactured by Hesai Technology. 
 Developed based on [HesaiLidar_SDK_2.0](https://github.com/HesaiTechnology/HesaiLidar_SDK_2.0), After launched, the project will monitor UDP packets from Lidar,parse data and publish point cloud frames into ROS topic
 
+## Castella fork: Jazzy upgrade (2026-10-28)
+
+`feature/compact-output-upstream-20261028` merges official driver commit
+[`3d54078`](https://github.com/HesaiTechnology/HesaiLidar_ROS_2.0/commit/3d54078a3d770004ef30ec2cacc26673f4172b22)
+(v2.0.12 plus subsequent build updates) into the existing compact-output branch.
+The unmodified SDK is pinned to
+[`357ff14`](https://github.com/HesaiTechnology/HesaiLidar_SDK_2.0/commit/357ff14c0b4486d21ac0de0b218e34546276cacb).
+The previous Castella driver remains available at `b51a404` on `feature/compact-output`.
+
+The ROS 2 compact crop/stride/range filter, per-point timestamps, scan-end timing
+record, diagnostics and explicit JT128 mode selection are retained. The upstream
+ROS IMU conversion was removed, but the pinned JT128 protocol 1.4 SDK still
+decodes acceleration in g and angular velocity in degrees/s. This fork retains
+the conversion to m/s² and rad/s to preserve the FAST-LIO input contract.
+Both sensor timestamps and host receive timestamps are covered by synthetic
+packet tests; the timestamp source is still selected by `use_timestamp_type`.
+PTP messages follow upstream's new variable-length payload definition.
+
+Offline tests require no LiDAR, sockets, motor power or ROS graph. In a Jazzy
+workspace containing this package and its recursively initialized SDK:
+
+```bash
+colcon build --packages-select hesai_ros_driver --cmake-args -DBUILD_TESTING=ON -DFIND_CUDA=OFF
+colcon test --packages-select hesai_ros_driver --return-code-on-test-failure
+colcon test-result --verbose
+```
+
+CUDA is optional. With a CUDA toolkit and GPU available, use a separate build and
+install directory; `89` below is for the tested RTX 4070 Laptop GPU:
+
+```bash
+colcon build --build-base build-gpu --install-base install-gpu --packages-select hesai_ros_driver \
+  --cmake-args -DBUILD_TESTING=ON -DFIND_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=89
+colcon test --build-base build-gpu --install-base install-gpu --packages-select hesai_ros_driver \
+  --return-code-on-test-failure
+colcon test-result --test-result-base build-gpu --verbose
+```
+
+The CUDA build additionally compares decoded JT128 coordinates and timestamps
+against CPU output. These comparisons report skipped if no CUDA device is
+available. `use_gpu: true` in YAML alone does not enable a CUDA build. Updating
+this source does not install CUDA or switch Castella's existing CPU build to GPU.
+These checks do not replace verification with live sensor packets and calibration.
+
+Validated on 2026-10-28 in isolated Ubuntu 24.04 / ROS 2 Jazzy containers:
+CPU driver plus Castella FAST-LIO reported 56 tests passing; CUDA 12.6 on the
+RTX 4070 Laptop GPU reported 14 tests passing, with no failures or skipped tests
+(counts from `colcon test-result`, including CTest entries). A separate compact
+pipeline comparison preserved all 37,964 FAST-LIO features and their deskew
+offsets from a synthetic 230,400-point input. No live LiDAR settings or running
+robot processes were changed during validation.
+
+The ROS 2 IMU publisher uses reliable, volatile history with 2000 samples
+(`imu_qos_depth`, configurable at startup). The old live-source depth of 20
+covered only about 50 ms at 400 Hz. Increasing history retains startup bursts;
+it does not interpolate missing IMU samples or change their timestamps.
+`imu_diagnostics` in the driver namespace reports source-stamp gaps over
+100 ms, non-increasing stamps, maximum callback interval, maximum publish
+duration and the published sample count. Counters/maxima are cumulative from
+driver startup; diagnostics are emitted once per second and on large gaps.
+These measurements distinguish SDK/source timestamp gaps from downstream ROS
+reader loss; neither a source gap nor a callback delay alone proves a hardware fault.
+
 ## Support Lidar type
 
 | Pandar       | OT           | QT           | XT           | AT           | FT           | JT           |
